@@ -1,0 +1,19 @@
+    model_options = {
+        "stepfun/step-3.5-flash:free": "Step 3.5 Flash (256K токенов)",
+        "nvidia/nemotron-3-super-120b-a12b:free": "Nemotron 3 Super (256K токенов)",
+        "arcee-ai/trinity-mini:free": "Trinity-mini (128K токенов)",
+        "z-ai/glm-4.5-air:free": "z-ai/glm-4.5-air:free (32K токенов)"
+    }
+    selected_model = st.selectbox(
+        "Модель",
+        options=list(model_options.keys()),
+        format_func=lambda x: model_options[x],
+        index=0
+    )
+    
+    # Устанавливаем лимит токенов для выбранной модели
+    model_limits = {
+        "stepfun/step-3.5-flash:free": 256000,
+        "nvidia/nemotron-3-super-120b-a12b:free": 256000,
+        "arcee-ai/trinity-mini:free": 128000,
+        "z-ai/glm-4.5-air:free": 32000
