@@ -1,11 +1,13 @@
-# day8_agent_token_counter.py (исправленная версия)
+# day9_agent_context_compression.py
 # Установка: pip install streamlit openai python-dotenv
 
 import os
 import json
 import glob
 import hashlib
+import time
 from datetime import datetime
+from collections import deque
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -53,24 +55,44 @@ def authenticate():
 
 
 # ============================================================
-# КЛАСС АГЕНТА
+# КЛАСС АГЕНТА С КОМПРЕССИЕЙ КОНТЕКСТА
 # ============================================================
-class TokenAwareAgent:
+class ContextCompressionAgent:
     def __init__(self, model="stepfun/step-3.5-flash:free", system_prompt=None, 
-                 max_history=20, session_id=None, persist_dir="chat_history",
-                 model_max_tokens=256000):
+                 session_id=None, persist_dir="chat_history",
+                 model_max_tokens=256000, window_size=6, compress_after=8):
+        
         self.model = model
         self.system_prompt = system_prompt
-        self.max_history = max_history
         self.model_max_tokens = model_max_tokens
         self.persist_dir = persist_dir
         self.session_id = session_id or self._generate_session_id()
-        self.history = []
         
-        # Единое хранилище статистики токенов
+        # Настройки компрессии
+        self.window_size = window_size  # Сколько последних сообщений храним без сжатия
+        self.compress_after = compress_after  # Через сколько сообщений сжимаем
+        
+        # Хранилище
+        self.full_history = []  # Полная история (для сохранения и отладки)
+        self.recent_messages = []  # Последние сообщения без сжатия
+        self.summaries = []  # Список summary старых частей
+        
+        # Статистика токенов
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
-        self.last_usage = None  # Храним последний usage для отображения
+        self.last_usage = None
+        
+        # Статистика компрессии
+        self.compression_stats = {
+            "compressions_count": 0,
+            "total_tokens_saved": 0,
+            "original_tokens": 0,
+            "compressed_tokens": 0
+        }
+        
+        # Защита от rate limit
+        self.request_timestamps = deque(maxlen=10)
+        self.min_interval = 2
         
         os.makedirs(self.persist_dir, exist_ok=True)
         
@@ -79,14 +101,16 @@ class TokenAwareAgent:
             api_key=os.environ.get("OPENROUTER_API_KEY"),
             default_headers={
                 "HTTP-Referer": os.environ.get("HTTP_REFERER", "https://your-domain.ru"),
-                "X-Title": "AI Challenge Day 8 - Token Counter"
+                "X-Title": "AI Challenge Day 9 - Context Compression"
             }
         )
         
         self._load_history()
         
-        if not self.history and self.system_prompt:
-            self.history.append({"role": "system", "content": self.system_prompt})
+        # Инициализируем с системным промптом
+        if not self.full_history and self.system_prompt:
+            system_msg = {"role": "system", "content": self.system_prompt}
+            self.full_history.append(system_msg)
             self._save_history()
     
     def _generate_session_id(self):
@@ -95,11 +119,239 @@ class TokenAwareAgent:
     def _get_history_path(self):
         return os.path.join(self.persist_dir, f"session_{self.session_id}.json")
     
+    def _estimate_tokens(self, messages):
+        """Грубая оценка токенов для проверки порогов"""
+        total_chars = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if content is not None:  # Защита от None
+                total_chars += len(content)
+        return total_chars // 4
+
+    def _clean_messages(self, messages):
+        """Очищает список сообщений от None и пустых строк"""
+        cleaned = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if content and isinstance(content, str) and content.strip():
+                    cleaned.append(msg)
+        return cleaned
+    
+    def _check_rate_limit(self):
+        """Проверяет, не слишком ли часто мы шлем запросы"""
+        now = time.time()
+        
+        while self.request_timestamps and now - self.request_timestamps[0] > 60:
+            self.request_timestamps.popleft()
+        
+        if len(self.request_timestamps) >= 5:
+            wait_time = 60 - (now - self.request_timestamps[0])
+            if wait_time > 0:
+                return False, f"Слишком много запросов! Подожди {wait_time:.1f} секунд."
+        
+        if self.request_timestamps and now - self.request_timestamps[-1] < self.min_interval:
+            return False, f"Слишком быстро! Подожди {self.min_interval} секунды."
+        
+        return True, "OK"
+    
+    def _create_summary(self, messages_to_compress):
+        """Создает summary с увеличенным max_tokens"""
+        
+        formatted_messages = []
+        for msg in messages_to_compress:
+            role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Агент"
+            content = msg.get("content", "")
+            if content and isinstance(content, str) and content.strip():
+                # Обрезаем слишком длинные сообщения для промпта
+                if len(content) > 800:
+                    content = content[:800] + "..."
+                formatted_messages.append(f"{role}: {content}")
+        
+        if not formatted_messages:
+            return "[Нет сообщений для сжатия]"
+        
+        dialog_text = "\n".join(formatted_messages)
+        
+        # Улучшенный промпт с четкой структурой
+        summary_prompt = f"""Создай КРАТКУЮ выжимку этого диалога в СТРУКТУРИРОВАННОМ виде.
+
+    ПРАВИЛА:
+    1. Используй маркированный список
+    2. Сохрани ключевые факты, код, решения
+    3. Не теряй последовательность
+    4. Объем: до 500 символов
+
+    ДИАЛОГ:
+    {dialog_text}
+
+    ВЫЖИМКА:"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": summary_prompt}],
+                temperature=0.3,
+                max_tokens=500  # Увеличил с 300 до 500
+            )
+            
+            summary = response.choices[0].message.content
+            
+            if not summary or len(summary) < 10:
+                return self._create_fallback_summary(messages_to_compress)
+            
+            # Учитываем токены
+            self.total_prompt_tokens += response.usage.prompt_tokens
+            self.total_completion_tokens += response.usage.completion_tokens
+            
+            return summary.strip()
+            
+        except Exception as e:
+            print(f"❌ Ошибка суммаризации: {e}")
+            return self._create_fallback_summary(messages_to_compress)
+
+    def _create_fallback_summary(self, messages):
+        """Качественный fallback summary"""
+        # Извлекаем ключевые темы
+        topics = []
+        for msg in messages[-3:]:  # Берем последние 3 сообщения
+            content = msg.get("content", "")
+            if content:
+                # Простой экстракт ключевых слов
+                words = content.split()[:5]
+                if words:
+                    topics.extend(words[:2])
+        
+        unique_topics = list(set(topics))[:3]
+        if unique_topics:
+            return f"[Диалог о {', '.join(unique_topics)}...]"
+        return f"[Диалог из {len(messages)} сообщений]"
+ 
+    def _compress_old_messages(self):
+        """Сжимает старые сообщения, которые выходят за окно"""
+        # задержка для повышения вероятности успешной компрессии.
+        time.sleep(4)
+        # Очищаем recent_messages от пустых сообщений
+        self.recent_messages = self._clean_messages(self.recent_messages)
+        
+        if len(self.recent_messages) <= self.window_size:
+            return
+        
+        # Сообщения для сжатия (все кроме последних window_size)
+        to_compress = self.recent_messages[:-self.window_size]
+        
+        # Фильтруем пустые сообщения
+        to_compress = [msg for msg in to_compress if msg.get("content")]
+        
+        if not to_compress:
+            # Если нет нормальных сообщений, просто обрезаем
+            self.recent_messages = self.recent_messages[-self.window_size:]
+            return
+        
+        # Считаем токены до сжатия
+        original_tokens = self._estimate_tokens(to_compress)
+        
+        print(f"\n{'='*50}")
+        print(f"🗜️ ЗАПУСК КОМПРЕССИИ")
+        print(f"   Сообщений для сжатия: {len(to_compress)}")
+        print(f"   Токенов до сжатия: {original_tokens}")
+        print(f"{'='*50}")
+        
+        # Создаем summary с retry
+        summary = self._create_summary(to_compress)
+        
+        # Считаем токены после сжатия
+        compressed_tokens = self._estimate_tokens([{"content": summary}])
+        
+        # Сохраняем summary
+        self.summaries.append({
+            "text": summary,
+            "timestamp": datetime.now().isoformat(),
+            "original_messages": len(to_compress),
+            "original_tokens": original_tokens,
+            "compressed_tokens": compressed_tokens
+        })
+        
+        # Обновляем статистику компрессии
+        self.compression_stats["compressions_count"] += 1
+        self.compression_stats["total_tokens_saved"] += (original_tokens - compressed_tokens)
+        self.compression_stats["original_tokens"] += original_tokens
+        self.compression_stats["compressed_tokens"] += compressed_tokens
+        
+        # Обновляем recent messages (оставляем только последние)
+        self.recent_messages = self.recent_messages[-self.window_size:]
+        
+        print(f"✅ КОМПРЕССИЯ ЗАВЕРШЕНА")
+        print(f"   Токены: {original_tokens} → {compressed_tokens}")
+        print(f"   Экономия: {original_tokens - compressed_tokens} токенов")
+        print(f"   Сжатие: {(1 - compressed_tokens/original_tokens)*100:.1f}%")
+        print(f"{'='*50}\n")
+
+
+    def _build_context(self):
+        """Собирает контекст для отправки в API"""
+        context = []
+        
+        # 1. Системный промпт
+        if self.system_prompt:
+            context.append({"role": "system", "content": self.system_prompt})
+        
+        # 2. Все summary (объединяем в один блок)
+        if self.summaries:
+            combined_summaries = []
+            for i, summary_data in enumerate(self.summaries, 1):
+                summary_text = summary_data.get('text', '')
+                # Фильтруем фолбэки и обрезанные summary
+                if summary_text and summary_text != "None" and not summary_text.startswith("[Диалог из"):
+                    # Обрезаем слишком длинные summary для контекста
+                    if len(summary_text) > 500:
+                        summary_text = summary_text[:500] + "..."
+                    combined_summaries.append(f"[Часть {i}]\n{summary_text}")
+            
+            if combined_summaries:
+                summary_text = "\n\n".join(combined_summaries)
+                context.append({
+                    "role": "system",
+                    "content": f"📚 ИСТОРИЯ ДИАЛОГА (сжатая):\n\n{summary_text}"
+                })
+        
+        # 3. Последние сообщения (без сжатия)
+        clean_messages = []
+        for msg in self.recent_messages[-self.window_size:]:  # Берем только последние window_size
+            content = msg.get("content")
+            if content and isinstance(content, str) and content.strip():
+                clean_messages.append(msg)
+        
+        context.extend(clean_messages)
+        
+        # Отладка
+        print(f"\n📊 КОНТЕКСТ ДЛЯ API:")
+        print(f"   - System prompt: {len(self.system_prompt) if self.system_prompt else 0} символов")
+        print(f"   - Summaries: {len(combined_summaries)} блоков" if self.summaries else "   - Summaries: нет")
+        print(f"   - Recent messages: {len(clean_messages)} сообщений")
+        print(f"   - Всего сообщений в контексте: {len(context)}")
+        
+        return context
+
+
     def get_token_stats(self):
         """Возвращает актуальную статистику токенов"""
         total_tokens = self.total_prompt_tokens + self.total_completion_tokens
         usage_percent = (total_tokens / self.model_max_tokens) * 100 if self.model_max_tokens else 0
         usage_percent = min(usage_percent, 100)
+        
+        # Добавляем статистику компрессии
+        compression_info = {
+            "compressions": self.compression_stats["compressions_count"],
+            "tokens_saved": self.compression_stats["total_tokens_saved"],
+            "efficiency": 0
+        }
+        
+        if self.compression_stats["original_tokens"] > 0:
+            compression_info["efficiency"] = round(
+                (1 - self.compression_stats["compressed_tokens"] / self.compression_stats["original_tokens"]) * 100,
+                1
+            )
         
         return {
             "prompt_tokens": self.total_prompt_tokens,
@@ -108,13 +360,15 @@ class TokenAwareAgent:
             "max_tokens": self.model_max_tokens,
             "usage_percent": round(usage_percent, 1),
             "is_critical": usage_percent > 90,
-            "is_warning": usage_percent > 70
+            "is_warning": usage_percent > 70,
+            "compression": compression_info
         }
     
     def _save_history(self):
+        """Сохраняет всю историю (включая summaries)"""
         try:
             first_user_msg = ""
-            for msg in self.history:
+            for msg in self.full_history:
                 if msg.get("role") == "user":
                     words = msg["content"].split()[:3]
                     first_user_msg = " ".join(words)
@@ -126,13 +380,16 @@ class TokenAwareAgent:
                 "session_id": self.session_id,
                 "model": self.model,
                 "system_prompt": self.system_prompt,
-                "messages": self.history,
+                "full_history": self.full_history,
+                "recent_messages": self.recent_messages,
+                "summaries": self.summaries,
                 "last_updated": datetime.now().isoformat(),
-                "message_count": len(self.history),
+                "message_count": len(self.full_history),
                 "preview": first_user_msg[:50] if first_user_msg else "Новый диалог",
                 "token_stats": token_stats,
                 "total_prompt_tokens": self.total_prompt_tokens,
-                "total_completion_tokens": self.total_completion_tokens
+                "total_completion_tokens": self.total_completion_tokens,
+                "compression_stats": self.compression_stats
             }
             with open(self._get_history_path(), 'w', encoding='utf-8') as f:
                 json.dump(history_to_save, f, ensure_ascii=False, indent=2)
@@ -142,46 +399,58 @@ class TokenAwareAgent:
             return False
     
     def _load_history(self):
+        """Загружает историю из файла"""
         history_path = self._get_history_path()
         if os.path.exists(history_path):
             try:
                 with open(history_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.history = data.get("messages", [])
+                    self.full_history = data.get("full_history", [])
+                    self.recent_messages = data.get("recent_messages", [])
+                    self.summaries = data.get("summaries", [])
                     self.total_prompt_tokens = data.get("total_prompt_tokens", 0)
                     self.total_completion_tokens = data.get("total_completion_tokens", 0)
+                    self.compression_stats = data.get("compression_stats", {
+                        "compressions_count": 0,
+                        "total_tokens_saved": 0,
+                        "original_tokens": 0,
+                        "compressed_tokens": 0
+                    })
                     return True
             except Exception as e:
                 print(f"❌ Ошибка загрузки: {e}")
-                self.history = []
                 return False
-        else:
-            self.history = []
-            return False
-    
-    def delete_session(self, session_id):
-        """Удаляет файл сессии"""
-        file_path = os.path.join(self.persist_dir, f"session_{session_id}.json")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return True
         return False
     
-    def estimate_tokens(self, text):
-        """Грубая оценка токенов для предупреждения"""
-        return len(text) // 4
-    
     def think(self, user_input):
+        """Основной метод для отправки сообщения"""
         if not user_input or not user_input.strip():
             return "❌ Пустой запрос. Напиши что-нибудь!", None
         
-        self.history.append({"role": "user", "content": user_input})
-        self._trim_history()
+        # Проверяем rate limit
+        ok, message = self._check_rate_limit()
+        if not ok:
+            return f"⏸️ {message}", None
+        
+        # Добавляем сообщение пользователя
+        user_msg = {"role": "user", "content": user_input}
+        self.full_history.append(user_msg)
+        self.recent_messages.append(user_msg)
+        
+        # Проверяем, нужно ли сжать
+        if len(self.recent_messages) > self.compress_after:
+            self._compress_old_messages()
+        
+        # Строим контекст для API
+        context = self._build_context()
+        
+        # Добавляем метку времени
+        self.request_timestamps.append(time.time())
         
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.history.copy(),
+                messages=context,
                 temperature=0.7,
                 max_tokens=2000
             )
@@ -194,12 +463,16 @@ class TokenAwareAgent:
                 "total_tokens": response.usage.total_tokens
             }
             
-            # Обновляем общую статистику ТОЛЬКО здесь, один раз
-            self.total_prompt_tokens = api_usage["prompt_tokens"]
-            self.total_completion_tokens = api_usage["completion_tokens"]
+            # Обновляем статистику
+            self.total_prompt_tokens += api_usage["prompt_tokens"]
+            self.total_completion_tokens += api_usage["completion_tokens"]
             self.last_usage = api_usage
             
-            self.history.append({"role": "assistant", "content": agent_response})
+            # Добавляем ответ
+            assistant_msg = {"role": "assistant", "content": agent_response}
+            self.full_history.append(assistant_msg)
+            self.recent_messages.append(assistant_msg)
+            
             self._save_history()
             
             return agent_response, api_usage
@@ -207,42 +480,34 @@ class TokenAwareAgent:
         except Exception as e:
             return f"❌ Ошибка API: {str(e)}", None
     
-    def _trim_history(self):
-        if len(self.history) > self.max_history:
-            if self.system_prompt and self.history and self.history[0]["role"] == "system":
-                system_msg = self.history[0]
-                self.history = [system_msg] + self.history[-(self.max_history - 1):]
-            else:
-                self.history = self.history[-self.max_history:]
-    
-    def _trim_aggressive(self):
-        """Агрессивное обрезание при переполнении"""
-        if self.system_prompt and self.history and self.history[0]["role"] == "system":
-            system_msg = self.history[0]
-            self.history = [system_msg] + self.history[-5:]
-        else:
-            self.history = self.history[-5:]
-        self._save_history()
-    
     def reset(self):
-        self.history = []
+        """Сбрасывает диалог"""
+        self.full_history = []
+        self.recent_messages = []
+        self.summaries = []
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.last_usage = None
+        self.compression_stats = {
+            "compressions_count": 0,
+            "total_tokens_saved": 0,
+            "original_tokens": 0,
+            "compressed_tokens": 0
+        }
+        
         if self.system_prompt:
-            self.history.append({"role": "system", "content": self.system_prompt})
+            system_msg = {"role": "system", "content": self.system_prompt}
+            self.full_history.append(system_msg)
+        
         self._save_history()
     
     def get_history(self):
-        return self.history.copy()
+        """Возвращает полную историю для отображения"""
+        return self.full_history.copy()
     
-    def get_session_info(self):
-        return {
-            "session_id": self.session_id,
-            "message_count": len(self.history),
-            "model": self.model,
-            "token_stats": self.get_token_stats()
-        }
+    def get_compression_info(self):
+        """Возвращает информацию о компрессии"""
+        return self.compression_stats
 
 
 # ============================================================
@@ -256,9 +521,9 @@ def get_all_sessions(persist_dir="chat_history"):
                 with open(f, 'r', encoding='utf-8') as file:
                     data = json.load(file)
                     session_id = data.get("session_id", "")
-                    
                     preview = data.get("preview", "Новый диалог")
                     last_updated = data.get("last_updated", "")
+                    
                     if last_updated:
                         try:
                             dt = datetime.fromisoformat(last_updated)
@@ -269,12 +534,16 @@ def get_all_sessions(persist_dir="chat_history"):
                         date_str = "неизвестно"
                     
                     token_stats = data.get("token_stats", {})
-                    token_info = f"{token_stats.get('total_tokens', 0)} токенов" if token_stats else ""
+                    token_info = f"{token_stats.get('total_tokens', 0)} токенов"
+                    
+                    # Добавляем информацию о компрессии
+                    compression_stats = data.get("compression_stats", {})
+                    comp_info = f" | 🗜️ {compression_stats.get('compressions_count', 0)} сжатий"
                     
                     sessions.append({
                         "id": session_id,
                         "name": f"{preview[:40]} — {date_str}",
-                        "token_info": token_info,
+                        "token_info": token_info + comp_info,
                         "message_count": data.get("message_count", 0),
                         "file": f
                     })
@@ -295,8 +564,8 @@ def delete_session_file(session_id, persist_dir="chat_history"):
 # STREAMLIT ИНТЕРФЕЙС
 # ============================================================
 st.set_page_config(
-    page_title="AI Agent — Токен-менеджер",
-    page_icon="📊",
+    page_title="AI Agent — Контекст-менеджер",
+    page_icon="🗜️",
     layout="wide"
 )
 
@@ -304,8 +573,8 @@ if not check_auth():
     authenticate()
     st.stop()
 
-st.title("📊 AI Агент — Токен-менеджер")
-st.caption("Подсчёт токенов через API | День 8")
+st.title("🗜️ AI Агент — Управление контекстом с компрессией")
+st.caption("День 9: Сжатие истории для экономии токенов")
 
 # Боковая панель
 with st.sidebar:
@@ -315,7 +584,6 @@ with st.sidebar:
         "stepfun/step-3.5-flash:free": "Step 3.5 Flash (256K токенов)",
         "nvidia/nemotron-3-super-120b-a12b:free": "Nemotron 3 Super (256K токенов)",
         "arcee-ai/trinity-mini:free": "Trinity-mini (128K токенов)",
-        "z-ai/glm-4.5-air:free": "z-ai/glm-4.5-air:free (32K токенов)"
     }
     selected_model = st.selectbox(
         "Модель",
@@ -328,7 +596,6 @@ with st.sidebar:
         "stepfun/step-3.5-flash:free": 256000,
         "nvidia/nemotron-3-super-120b-a12b:free": 256000,
         "arcee-ai/trinity-mini:free": 128000,
-        "z-ai/glm-4.5-air:free": 32000
     }
     model_max_tokens = model_limits.get(selected_model, 256000)
     
@@ -348,15 +615,19 @@ with st.sidebar:
     else:
         system_prompt = "Ты — Мастер Йода. Отвечаешь с инверсией слов, загадочно. Начинаешь фразы с 'М-м-м...'."
     
+    # Настройки компрессии
+    st.divider()
+    st.subheader("🗜️ Настройки компрессии")
+    window_size = st.slider("Размер окна (сообщений без сжатия)", 4, 12, 6)
+    compress_after = st.slider("Сжимать после (сообщений)", 6, 20, 8)
+    
     st.divider()
     
-    # Токен-статистика (только из агента, единый источник правды)
+    # Статистика
     if "agent" in st.session_state and st.session_state.agent:
         token_stats = st.session_state.agent.get_token_stats()
         
         st.subheader("📊 Токен-статистика")
-        
-        # Прогресс-бар - теперь точно будет отображаться
         progress_value = token_stats["usage_percent"] / 100
         st.progress(progress_value, text=f"{token_stats['usage_percent']}% использовано")
         
@@ -367,27 +638,20 @@ with st.sidebar:
             st.metric("📤 Токенов ответа", f"{token_stats['completion_tokens']:,}")
         
         st.metric("📚 Всего токенов", f"{token_stats['total_tokens']:,}")
-        st.caption(f"🎯 Лимит модели: {token_stats['max_tokens']:,} токенов")
         
-        if token_stats["is_critical"]:
-            st.warning("⚠️ **КРИТИЧЕСКИЙ УРОВЕНЬ!** Контекст почти заполнен.")
-        elif token_stats["is_warning"]:
-            st.info("⚠️ Контекст заполнен более чем на 70%.")
-        
-        # Отображение последнего запроса
-        if st.session_state.agent.last_usage:
+        # Статистика компрессии
+        if token_stats.get("compression"):
+            comp = token_stats["compression"]
             st.divider()
-            st.caption("📊 Последний запрос:")
-            last = st.session_state.agent.last_usage
-            st.caption(f"• Запрос: {last['prompt_tokens']:,} токенов")
-            st.caption(f"• Ответ: {last['completion_tokens']:,} токенов")
-            st.caption(f"• Всего: {last['total_tokens']:,} токенов")
+            st.subheader("🗜️ Эффективность компрессии")
+            st.metric("Количество сжатий", comp["compressions"])
+            st.metric("Сэкономлено токенов", f"{comp['tokens_saved']:,}")
+            st.metric("Эффективность", f"{comp['efficiency']}%")
     
     st.divider()
     
-    # История диалогов с кнопками удаления
+    # История диалогов
     st.subheader("📁 История диалогов")
-    
     all_sessions = get_all_sessions()
     
     if all_sessions:
@@ -397,7 +661,7 @@ with st.sidebar:
                 st.write(f"**{sess['name']}**")
                 st.caption(f"{sess['message_count']} сообщений | {sess['token_info']}")
             with col2:
-                if st.button("🗑️", key=f"del_{sess['id']}", help="Удалить этот диалог"):
+                if st.button("🗑️", key=f"del_{sess['id']}"):
                     if delete_session_file(sess['id']):
                         st.success(f"✅ Диалог удалён")
                         if "agent" in st.session_state and st.session_state.agent.session_id == sess['id']:
@@ -418,14 +682,15 @@ with st.sidebar:
         if st.button("🔄 Переключить сессию", use_container_width=True):
             if selected_session_id != st.session_state.get("session_id"):
                 with st.spinner("Загрузка диалога..."):
-                    new_agent = TokenAwareAgent(
+                    new_agent = ContextCompressionAgent(
                         model=selected_model,
                         system_prompt=system_prompt,
                         session_id=selected_session_id,
-                        model_max_tokens=model_max_tokens
+                        model_max_tokens=model_max_tokens,
+                        window_size=window_size,
+                        compress_after=compress_after
                     )
                     new_agent._load_history()
-                    
                     st.session_state.agent = new_agent
                     st.session_state.session_id = selected_session_id
                     st.rerun()
@@ -439,50 +704,41 @@ with st.sidebar:
                 st.session_state.agent.reset()
             st.rerun()
     with col2:
-        if st.button("✂️ Обрезать историю", use_container_width=True, help="Оставляет системный промпт + 5 последних сообщений"):
+        if st.button("🔄 Принудительно сжать", use_container_width=True):
             if "agent" in st.session_state:
-                agent = st.session_state.agent
-                if agent.system_prompt:
-                    system_msg = {"role": "system", "content": agent.system_prompt}
-                    agent.history = [system_msg] + agent.history[-5:]
-                else:
-                    agent.history = agent.history[-5:]
-                agent._save_history()
-                st.success("✅ История обрезана")
+                st.session_state.agent._compress_old_messages()
+                st.session_state.agent._save_history()
+                st.success("✅ Принудительное сжатие выполнено")
                 st.rerun()
     
     st.divider()
-    st.caption("📊 Токены считаются из ответа API")
-    st.caption("🧠 Точность: 100%")
+    st.caption("🗜️ Старые сообщения сжимаются в summary")
+    st.caption(f"📦 Окно: {window_size} сообщений без сжатия")
+    st.caption(f"⚙️ Сжатие каждые {compress_after} сообщений")
 
 # Инициализация агента
 if "agent" not in st.session_state or st.session_state.agent is None:
-    st.session_state.agent = TokenAwareAgent(
+    st.session_state.agent = ContextCompressionAgent(
         model=selected_model,
         system_prompt=system_prompt,
         session_id=st.session_state.get("session_id", None),
-        model_max_tokens=model_max_tokens
+        model_max_tokens=model_max_tokens,
+        window_size=window_size,
+        compress_after=compress_after
     )
     st.session_state.session_id = st.session_state.agent.session_id
 
 # Если изменилась модель
 if st.session_state.agent.model != selected_model:
     old_session_id = st.session_state.agent.session_id
-    old_history = st.session_state.agent.history
-    old_total_prompt = st.session_state.agent.total_prompt_tokens
-    old_total_completion = st.session_state.agent.total_completion_tokens
-    
-    st.session_state.agent = TokenAwareAgent(
+    st.session_state.agent = ContextCompressionAgent(
         model=selected_model,
         system_prompt=system_prompt,
         session_id=old_session_id,
-        model_max_tokens=model_max_tokens
+        model_max_tokens=model_max_tokens,
+        window_size=window_size,
+        compress_after=compress_after
     )
-    # Сохраняем старую статистику
-    st.session_state.agent.history = old_history
-    st.session_state.agent.total_prompt_tokens = old_total_prompt
-    st.session_state.agent.total_completion_tokens = old_total_completion
-    st.session_state.agent.model_max_tokens = model_max_tokens
     st.session_state.session_id = st.session_state.agent.session_id
 
 # Отображение диалога
