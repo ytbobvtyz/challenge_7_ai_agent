@@ -1,4 +1,4 @@
-# day9_agent_context_compression.py
+# day10_agent_context_strategies.py
 # Установка: pip install streamlit openai python-dotenv
 
 import os
@@ -8,6 +8,7 @@ import hashlib
 import time
 from datetime import datetime
 from collections import deque
+from abc import ABC, abstractmethod
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -55,40 +56,299 @@ def authenticate():
 
 
 # ============================================================
-# КЛАСС АГЕНТА С КОМПРЕССИЕЙ КОНТЕКСТА
+# СТРАТЕГИИ ПАМЯТИ
 # ============================================================
-class ContextCompressionAgent:
-    def __init__(self, model="stepfun/step-3.5-flash:free", system_prompt=None, 
+
+class MemoryStrategy(ABC):
+    @abstractmethod
+    def add_message(self, message):
+        pass
+    
+    @abstractmethod
+    def get_context(self, system_prompt):
+        pass
+    
+    @abstractmethod
+    def get_stats(self):
+        pass
+    
+    @abstractmethod
+    def reset(self):
+        pass
+
+
+class SlidingWindowMemory(MemoryStrategy):
+    """Стратегия 1: Скользящее окно — храним только последние N сообщений"""
+    
+    def __init__(self, window_size=10):
+        self.window_size = window_size
+        self.messages = deque(maxlen=window_size)
+        self.total_messages = 0
+    
+    def add_message(self, message):
+        self.messages.append(message)
+        self.total_messages += 1
+    
+    def get_context(self, system_prompt=None):
+        context = []
+        if system_prompt:
+            context.append({"role": "system", "content": system_prompt})
+        context.extend(list(self.messages))
+        return context
+    
+    def get_stats(self):
+        return {
+            "type": "Sliding Window",
+            "window_size": self.window_size,
+            "current_messages": len(self.messages),
+            "total_messages": self.total_messages
+        }
+    
+    def reset(self):
+        self.messages.clear()
+        self.total_messages = 0
+
+
+class FactMemory(MemoryStrategy):
+    """Стратегия 2: Key-Value Memory — факты + последние сообщения"""
+    
+    def __init__(self, window_size=5):
+        self.window_size = window_size
+        self.messages = deque(maxlen=window_size)
+        self.facts = {}
+        self.fact_history = []
+        self.total_messages = 0
+    
+    def add_message(self, message):
+        self.messages.append(message)
+        self.total_messages += 1
+        
+        if message["role"] == "assistant" and "<<<FACTS>>>" in message["content"]:
+            self._extract_facts(message["content"])
+    
+    def _extract_facts(self, content):
+        """Извлекает факты из ответа модели"""
+        try:
+            if "<<<FACTS>>>" in content:
+                parts = content.split("<<<FACTS>>>")
+                facts_part = parts[1].split("<<<END_FACTS>>>")[0]
+                
+                for line in facts_part.strip().split('\n'):
+                    line = line.strip().lstrip('- ')
+                    if ': ' in line:
+                        key, value = line.split(': ', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        if key in self.facts and self.facts[key] != value:
+                            self.fact_history.append({
+                                "key": key,
+                                "old": self.facts[key],
+                                "new": value,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                        
+                        self.facts[key] = value
+        except Exception as e:
+            print(f"⚠️ Ошибка парсинга фактов: {e}")
+    
+    def get_context(self, system_prompt=None):
+        context = []
+        
+        if system_prompt:
+            context.append({"role": "system", "content": system_prompt})
+        
+        if self.facts:
+            facts_text = "\n".join([f"- {k}: {v}" for k, v in self.facts.items()])
+            context.append({
+                "role": "system",
+                "content": f"📌 ИЗВЕСТНЫЕ ФАКТЫ ИЗ ДИАЛОГА:\n{facts_text}"
+            })
+        
+        context.extend(list(self.messages))
+        
+        return context
+    
+    def get_stats(self):
+        return {
+            "type": "Key-Value Memory (Facts)",
+            "window_size": self.window_size,
+            "current_messages": len(self.messages),
+            "total_messages": self.total_messages,
+            "facts_count": len(self.facts),
+            "fact_changes": len(self.fact_history)
+        }
+    
+    def reset(self):
+        self.messages.clear()
+        self.facts.clear()
+        self.fact_history.clear()
+        self.total_messages = 0
+
+
+class BranchingMemory(MemoryStrategy):
+    """Стратегия 3: Branching — ветки диалога с чекапоинтами"""
+    
+    def __init__(self, window_size=5):
+        self.window_size = window_size
+        self.branches = {"main": deque(maxlen=window_size)}
+        self.active_branch = "main"
+        self.checkpoints = []
+        self.total_messages = 0
+    
+    def add_message(self, message):
+        if self.active_branch not in self.branches:
+            self.branches[self.active_branch] = deque(maxlen=self.window_size)
+        self.branches[self.active_branch].append(message)
+        self.total_messages += 1
+    
+    def get_messages(self):
+        """Возвращает сообщения активной ветки для отображения"""
+        if self.active_branch in self.branches:
+            return list(self.branches[self.active_branch])
+        return []
+    
+    def get_context(self, system_prompt=None):
+        context = []
+        if system_prompt:
+            context.append({"role": "system", "content": system_prompt})
+        
+        context.append({
+            "role": "system",
+            "content": f"🌿 Текущая ветка: {self.active_branch}"
+        })
+        
+        if self.active_branch in self.branches:
+            context.extend(list(self.branches[self.active_branch]))
+        
+        return context
+    
+    def get_stats(self):
+        branches_list = list(self.branches.keys()) if self.branches else ["main"]
+        
+        return {
+            "type": "Branching Memory",
+            "window_size": self.window_size,
+            "active_branch": self.active_branch,
+            "branches_count": len(self.branches) if self.branches else 1,
+            "branches": branches_list,
+            "checkpoints_count": len(self.checkpoints) if self.checkpoints else 0,
+            "total_messages": self.total_messages
+        }
+    
+    def get_branches(self):
+        """Безопасное получение списка веток"""
+        return list(self.branches.keys()) if self.branches else ["main"]
+    
+    def create_checkpoint(self, name):
+        """Сохраняет чекапоинт текущей ветки"""
+        checkpoint = {
+            "name": name,
+            "branch": self.active_branch,
+            "messages": list(self.branches.get(self.active_branch, [])),
+            "timestamp": datetime.now().isoformat()
+        }
+        self.checkpoints.append(checkpoint)
+        return checkpoint
+    
+    def create_branch(self, checkpoint_name, new_branch_name):
+        """Создает новую ветку от чекапоинта"""
+        checkpoint = None
+        for cp in self.checkpoints:
+            if cp["name"] == checkpoint_name:
+                checkpoint = cp
+                break
+        
+        if checkpoint:
+            self.branches[new_branch_name] = deque(checkpoint["messages"], maxlen=self.window_size)
+            return True
+        return False
+    
+    def switch_branch(self, branch_name):
+        """Переключается на другую ветку"""
+        if branch_name in self.branches:
+            self.active_branch = branch_name
+            return True
+        return False
+    
+    def reset(self):
+        self.branches = {"main": deque(maxlen=self.window_size)}
+        self.active_branch = "main"
+        self.checkpoints = []
+        self.total_messages = 0
+
+
+# ============================================================
+# СИСТЕМНЫЕ ПРОМПТЫ
+# ============================================================
+
+SYSTEM_PROMPTS_BASE = {
+    "Джедай-программист": """Ты — джедай-программист по имени Дип. Отвечаешь мудро, с юмором, используешь аналогии из мира Звёздных Войн.""",
+    
+    "Психолог с баней": """Ты — необычный психолог. Ты не признаёшь классическую психологию и считаешь, что все проблемы лечатся парной, веником и хорошей беседой в предбаннике. Отвечай мудро, с народным юмором, предлагай "попарить косточки" вместо анализа. Будь уверен: баня лечит всё — от кода до душевных ран.""",
+    
+    "Поэт Борис Рыжий": """Ты — современный поэт. Отвечаешь стихами в духе Бориса Рыжего — немного грустными, пронзительными, с образами уходящего времени, дворов, электричек, негромкой интонацией. Твои ответы — короткие стихотворения, созвучные теме разговора."""
+}
+
+FACTS_INSTRUCTION = """
+
+⚠️ ТЕХНИЧЕСКОЕ ТРЕБОВАНИЕ (НЕ ИГНОРИРОВАТЬ):
+В КАЖДОМ ответе пользователю ты ОБЯЗАН добавлять блок FACTS в формате:
+<<<FACTS>>>
+- ключ: значение
+<<<END_FACTS>>>
+
+Правила:
+1. Блок FACTS добавляется ТОЛЬКО в ответах пользователю, НЕ в своих размышлениях
+2. Сохраняй ключевые факты: цели, ограничения, решения, предпочтения
+3. Обновляй факты, если они изменились
+4. Не дублируй уже известные факты без необходимости
+5. Формат: каждый факт с новой строки, начинается с "- "
+
+Пример:
+[Твой основной ответ...]
+
+<<<FACTS>>>
+- goal: создать приложение для заметок
+- constraints: авторизация Google, мобильная версия
+- decisions: начать с MVP
+<<<END_FACTS>>>
+"""
+
+def get_system_prompt(role, strategy):
+    """Возвращает системный промпт с учетом стратегии"""
+    base_prompt = SYSTEM_PROMPTS_BASE[role]
+    
+    if strategy == "facts":
+        return base_prompt + FACTS_INSTRUCTION
+    
+    return base_prompt
+
+
+# ============================================================
+# ОСНОВНОЙ АГЕНТ
+# ============================================================
+
+class Agent:
+    def __init__(self, model="stepfun/step-3.5-flash:free", role="Джедай-программист",
                  session_id=None, persist_dir="chat_history",
-                 model_max_tokens=256000, window_size=6, compress_after=8):
+                 model_max_tokens=256000, strategy="sliding_window",
+                 window_size=10):
         
         self.model = model
-        self.system_prompt = system_prompt
+        self.role = role
+        self.strategy_name = strategy
         self.model_max_tokens = model_max_tokens
         self.persist_dir = persist_dir
         self.session_id = session_id or self._generate_session_id()
         
-        # Настройки компрессии
-        self.window_size = window_size  # Сколько последних сообщений храним без сжатия
-        self.compress_after = compress_after  # Через сколько сообщений сжимаем
-        
-        # Хранилище
-        self.full_history = []  # Полная история (для сохранения и отладки)
-        self.recent_messages = []  # Последние сообщения без сжатия
-        self.summaries = []  # Список summary старых частей
+        # Динамический системный промпт
+        self.system_prompt = get_system_prompt(role, strategy)
         
         # Статистика токенов
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.last_usage = None
-        
-        # Статистика компрессии
-        self.compression_stats = {
-            "compressions_count": 0,
-            "total_tokens_saved": 0,
-            "original_tokens": 0,
-            "compressed_tokens": 0
-        }
         
         # Защита от rate limit
         self.request_timestamps = deque(maxlen=10)
@@ -101,16 +361,30 @@ class ContextCompressionAgent:
             api_key=os.environ.get("OPENROUTER_API_KEY"),
             default_headers={
                 "HTTP-Referer": os.environ.get("HTTP_REFERER", "https://your-domain.ru"),
-                "X-Title": "AI Challenge Day 9 - Context Compression"
+                "X-Title": "AI Challenge Day 10 - Context Strategies"
             }
         )
         
+        self._init_strategy(strategy, window_size)
         self._load_history()
-        
-        # Инициализируем с системным промптом
-        if not self.full_history and self.system_prompt:
-            system_msg = {"role": "system", "content": self.system_prompt}
-            self.full_history.append(system_msg)
+    
+    def _init_strategy(self, strategy, window_size):
+        """Инициализирует стратегию памяти"""
+        if strategy == "sliding_window":
+            self.memory = SlidingWindowMemory(window_size)
+        elif strategy == "facts":
+            self.memory = FactMemory(window_size)
+        elif strategy == "branching":
+            self.memory = BranchingMemory(window_size)
+        else:
+            self.memory = SlidingWindowMemory(window_size)
+    
+    def update_strategy(self, new_strategy, window_size):
+        """Обновляет стратегию и системный промпт"""
+        if new_strategy != self.strategy_name:
+            self.strategy_name = new_strategy
+            self._init_strategy(new_strategy, window_size)
+            self.system_prompt = get_system_prompt(self.role, new_strategy)
             self._save_history()
     
     def _generate_session_id(self):
@@ -120,26 +394,14 @@ class ContextCompressionAgent:
         return os.path.join(self.persist_dir, f"session_{self.session_id}.json")
     
     def _estimate_tokens(self, messages):
-        """Грубая оценка токенов для проверки порогов"""
         total_chars = 0
         for msg in messages:
             content = msg.get("content", "")
-            if content is not None:  # Защита от None
+            if content:
                 total_chars += len(content)
         return total_chars // 4
-
-    def _clean_messages(self, messages):
-        """Очищает список сообщений от None и пустых строк"""
-        cleaned = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                content = msg.get("content")
-                if content and isinstance(content, str) and content.strip():
-                    cleaned.append(msg)
-        return cleaned
     
     def _check_rate_limit(self):
-        """Проверяет, не слишком ли часто мы шлем запросы"""
         now = time.time()
         
         while self.request_timestamps and now - self.request_timestamps[0] > 60:
@@ -155,203 +417,10 @@ class ContextCompressionAgent:
         
         return True, "OK"
     
-    def _create_summary(self, messages_to_compress):
-        """Создает summary с увеличенным max_tokens"""
-        
-        formatted_messages = []
-        for msg in messages_to_compress:
-            role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Агент"
-            content = msg.get("content", "")
-            if content and isinstance(content, str) and content.strip():
-                # Обрезаем слишком длинные сообщения для промпта
-                if len(content) > 800:
-                    content = content[:800] + "..."
-                formatted_messages.append(f"{role}: {content}")
-        
-        if not formatted_messages:
-            return "[Нет сообщений для сжатия]"
-        
-        dialog_text = "\n".join(formatted_messages)
-        
-        # Улучшенный промпт с четкой структурой
-        summary_prompt = f"""Создай КРАТКУЮ выжимку этого диалога в СТРУКТУРИРОВАННОМ виде.
-
-    ПРАВИЛА:
-    1. Используй маркированный список
-    2. Сохрани ключевые факты, код, решения
-    3. Не теряй последовательность
-    4. Объем: до 500 символов
-
-    ДИАЛОГ:
-    {dialog_text}
-
-    ВЫЖИМКА:"""
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": summary_prompt}],
-                temperature=0.3,
-                max_tokens=500  # Увеличил с 300 до 500
-            )
-            
-            summary = response.choices[0].message.content
-            
-            if not summary or len(summary) < 10:
-                return self._create_fallback_summary(messages_to_compress)
-            
-            # Учитываем токены
-            self.total_prompt_tokens += response.usage.prompt_tokens
-            self.total_completion_tokens += response.usage.completion_tokens
-            
-            return summary.strip()
-            
-        except Exception as e:
-            print(f"❌ Ошибка суммаризации: {e}")
-            return self._create_fallback_summary(messages_to_compress)
-
-    def _create_fallback_summary(self, messages):
-        """Качественный fallback summary"""
-        # Извлекаем ключевые темы
-        topics = []
-        for msg in messages[-3:]:  # Берем последние 3 сообщения
-            content = msg.get("content", "")
-            if content:
-                # Простой экстракт ключевых слов
-                words = content.split()[:5]
-                if words:
-                    topics.extend(words[:2])
-        
-        unique_topics = list(set(topics))[:3]
-        if unique_topics:
-            return f"[Диалог о {', '.join(unique_topics)}...]"
-        return f"[Диалог из {len(messages)} сообщений]"
- 
-    def _compress_old_messages(self):
-        """Сжимает старые сообщения, которые выходят за окно"""
-        # задержка для повышения вероятности успешной компрессии.
-        time.sleep(4)
-        # Очищаем recent_messages от пустых сообщений
-        self.recent_messages = self._clean_messages(self.recent_messages)
-        
-        if len(self.recent_messages) <= self.window_size:
-            return
-        
-        # Сообщения для сжатия (все кроме последних window_size)
-        to_compress = self.recent_messages[:-self.window_size]
-        
-        # Фильтруем пустые сообщения
-        to_compress = [msg for msg in to_compress if msg.get("content")]
-        
-        if not to_compress:
-            # Если нет нормальных сообщений, просто обрезаем
-            self.recent_messages = self.recent_messages[-self.window_size:]
-            return
-        
-        # Считаем токены до сжатия
-        original_tokens = self._estimate_tokens(to_compress)
-        
-        print(f"\n{'='*50}")
-        print(f"🗜️ ЗАПУСК КОМПРЕССИИ")
-        print(f"   Сообщений для сжатия: {len(to_compress)}")
-        print(f"   Токенов до сжатия: {original_tokens}")
-        print(f"{'='*50}")
-        
-        # Создаем summary с retry
-        summary = self._create_summary(to_compress)
-        
-        # Считаем токены после сжатия
-        compressed_tokens = self._estimate_tokens([{"content": summary}])
-        
-        # Сохраняем summary
-        self.summaries.append({
-            "text": summary,
-            "timestamp": datetime.now().isoformat(),
-            "original_messages": len(to_compress),
-            "original_tokens": original_tokens,
-            "compressed_tokens": compressed_tokens
-        })
-        
-        # Обновляем статистику компрессии
-        self.compression_stats["compressions_count"] += 1
-        self.compression_stats["total_tokens_saved"] += (original_tokens - compressed_tokens)
-        self.compression_stats["original_tokens"] += original_tokens
-        self.compression_stats["compressed_tokens"] += compressed_tokens
-        
-        # Обновляем recent messages (оставляем только последние)
-        self.recent_messages = self.recent_messages[-self.window_size:]
-        
-        print(f"✅ КОМПРЕССИЯ ЗАВЕРШЕНА")
-        print(f"   Токены: {original_tokens} → {compressed_tokens}")
-        print(f"   Экономия: {original_tokens - compressed_tokens} токенов")
-        print(f"   Сжатие: {(1 - compressed_tokens/original_tokens)*100:.1f}%")
-        print(f"{'='*50}\n")
-
-
-    def _build_context(self):
-        """Собирает контекст для отправки в API"""
-        context = []
-        
-        # 1. Системный промпт
-        if self.system_prompt:
-            context.append({"role": "system", "content": self.system_prompt})
-        
-        # 2. Все summary (объединяем в один блок)
-        if self.summaries:
-            combined_summaries = []
-            for i, summary_data in enumerate(self.summaries, 1):
-                summary_text = summary_data.get('text', '')
-                # Фильтруем фолбэки и обрезанные summary
-                if summary_text and summary_text != "None" and not summary_text.startswith("[Диалог из"):
-                    # Обрезаем слишком длинные summary для контекста
-                    if len(summary_text) > 500:
-                        summary_text = summary_text[:500] + "..."
-                    combined_summaries.append(f"[Часть {i}]\n{summary_text}")
-            
-            if combined_summaries:
-                summary_text = "\n\n".join(combined_summaries)
-                context.append({
-                    "role": "system",
-                    "content": f"📚 ИСТОРИЯ ДИАЛОГА (сжатая):\n\n{summary_text}"
-                })
-        
-        # 3. Последние сообщения (без сжатия)
-        clean_messages = []
-        for msg in self.recent_messages[-self.window_size:]:  # Берем только последние window_size
-            content = msg.get("content")
-            if content and isinstance(content, str) and content.strip():
-                clean_messages.append(msg)
-        
-        context.extend(clean_messages)
-        
-        # Отладка
-        print(f"\n📊 КОНТЕКСТ ДЛЯ API:")
-        print(f"   - System prompt: {len(self.system_prompt) if self.system_prompt else 0} символов")
-        print(f"   - Summaries: {len(combined_summaries)} блоков" if self.summaries else "   - Summaries: нет")
-        print(f"   - Recent messages: {len(clean_messages)} сообщений")
-        print(f"   - Всего сообщений в контексте: {len(context)}")
-        
-        return context
-
-
     def get_token_stats(self):
-        """Возвращает актуальную статистику токенов"""
         total_tokens = self.total_prompt_tokens + self.total_completion_tokens
         usage_percent = (total_tokens / self.model_max_tokens) * 100 if self.model_max_tokens else 0
         usage_percent = min(usage_percent, 100)
-        
-        # Добавляем статистику компрессии
-        compression_info = {
-            "compressions": self.compression_stats["compressions_count"],
-            "tokens_saved": self.compression_stats["total_tokens_saved"],
-            "efficiency": 0
-        }
-        
-        if self.compression_stats["original_tokens"] > 0:
-            compression_info["efficiency"] = round(
-                (1 - self.compression_stats["compressed_tokens"] / self.compression_stats["original_tokens"]) * 100,
-                1
-            )
         
         return {
             "prompt_tokens": self.total_prompt_tokens,
@@ -361,14 +430,13 @@ class ContextCompressionAgent:
             "usage_percent": round(usage_percent, 1),
             "is_critical": usage_percent > 90,
             "is_warning": usage_percent > 70,
-            "compression": compression_info
+            "memory_stats": self.memory.get_stats()
         }
     
     def _save_history(self):
-        """Сохраняет всю историю (включая summaries)"""
         try:
             first_user_msg = ""
-            for msg in self.full_history:
+            for msg in self.memory.messages:
                 if msg.get("role") == "user":
                     words = msg["content"].split()[:3]
                     first_user_msg = " ".join(words)
@@ -376,20 +444,31 @@ class ContextCompressionAgent:
             
             token_stats = self.get_token_stats()
             
+            extra_data = {}
+            if isinstance(self.memory, FactMemory):
+                extra_data["facts"] = self.memory.facts
+                extra_data["fact_history"] = self.memory.fact_history
+            elif isinstance(self.memory, BranchingMemory):
+                branches_to_save = {}
+                for name, branch in self.memory.branches.items():
+                    branches_to_save[name] = list(branch)
+                extra_data["branches"] = branches_to_save
+                extra_data["active_branch"] = self.memory.active_branch
+                extra_data["checkpoints"] = self.memory.checkpoints
+            
             history_to_save = {
                 "session_id": self.session_id,
                 "model": self.model,
-                "system_prompt": self.system_prompt,
-                "full_history": self.full_history,
-                "recent_messages": self.recent_messages,
-                "summaries": self.summaries,
+                "role": self.role,
+                "strategy": self.strategy_name,
+                "messages": list(self.memory.messages),
                 "last_updated": datetime.now().isoformat(),
-                "message_count": len(self.full_history),
+                "message_count": self.memory.total_messages,
                 "preview": first_user_msg[:50] if first_user_msg else "Новый диалог",
                 "token_stats": token_stats,
                 "total_prompt_tokens": self.total_prompt_tokens,
                 "total_completion_tokens": self.total_completion_tokens,
-                "compression_stats": self.compression_stats
+                **extra_data
             }
             with open(self._get_history_path(), 'w', encoding='utf-8') as f:
                 json.dump(history_to_save, f, ensure_ascii=False, indent=2)
@@ -399,23 +478,33 @@ class ContextCompressionAgent:
             return False
     
     def _load_history(self):
-        """Загружает историю из файла"""
         history_path = self._get_history_path()
         if os.path.exists(history_path):
             try:
                 with open(history_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.full_history = data.get("full_history", [])
-                    self.recent_messages = data.get("recent_messages", [])
-                    self.summaries = data.get("summaries", [])
+                    
+                    saved_strategy = data.get("strategy", "sliding_window")
+                    if saved_strategy != self.strategy_name:
+                        self.strategy_name = saved_strategy
+                        self._init_strategy(saved_strategy, self.memory.window_size if hasattr(self.memory, 'window_size') else 10)
+                    
+                    for msg in data.get("messages", []):
+                        self.memory.add_message(msg)
+                    
+                    if isinstance(self.memory, FactMemory):
+                        self.memory.facts = data.get("facts", {})
+                        self.memory.fact_history = data.get("fact_history", [])
+                    elif isinstance(self.memory, BranchingMemory):
+                        branches_data = data.get("branches", {})
+                        for name, msgs in branches_data.items():
+                            self.memory.branches[name] = deque(msgs, maxlen=self.memory.window_size)
+                        self.memory.active_branch = data.get("active_branch", "main")
+                        self.memory.checkpoints = data.get("checkpoints", [])
+                        self.memory.total_messages = data.get("message_count", 0)
+                    
                     self.total_prompt_tokens = data.get("total_prompt_tokens", 0)
                     self.total_completion_tokens = data.get("total_completion_tokens", 0)
-                    self.compression_stats = data.get("compression_stats", {
-                        "compressions_count": 0,
-                        "total_tokens_saved": 0,
-                        "original_tokens": 0,
-                        "compressed_tokens": 0
-                    })
                     return True
             except Exception as e:
                 print(f"❌ Ошибка загрузки: {e}")
@@ -423,28 +512,18 @@ class ContextCompressionAgent:
         return False
     
     def think(self, user_input):
-        """Основной метод для отправки сообщения"""
         if not user_input or not user_input.strip():
             return "❌ Пустой запрос. Напиши что-нибудь!", None
         
-        # Проверяем rate limit
         ok, message = self._check_rate_limit()
         if not ok:
             return f"⏸️ {message}", None
         
-        # Добавляем сообщение пользователя
         user_msg = {"role": "user", "content": user_input}
-        self.full_history.append(user_msg)
-        self.recent_messages.append(user_msg)
+        self.memory.add_message(user_msg)
         
-        # Проверяем, нужно ли сжать
-        if len(self.recent_messages) > self.compress_after:
-            self._compress_old_messages()
+        context = self.memory.get_context(self.system_prompt)
         
-        # Строим контекст для API
-        context = self._build_context()
-        
-        # Добавляем метку времени
         self.request_timestamps.append(time.time())
         
         try:
@@ -456,22 +535,39 @@ class ContextCompressionAgent:
             )
             agent_response = response.choices[0].message.content
             
-            # Получаем данные из API
+            if isinstance(self.memory, FactMemory) and "<<<FACTS>>>" not in agent_response:
+                print("⚠️ Модель не добавила FACTS, делаем повторный запрос...")
+                
+                reminder_context = context + [{
+                    "role": "user",
+                    "content": f"⚠️ Твой предыдущий ответ НЕ содержал блок FACTS.\n\nПожалуйста, ответь СНОВА на вопрос: '{user_input}'\n\nОБЯЗАТЕЛЬНО добавь блок FACTS в формате:\n<<<FACTS>>>\n- ключ: значение\n<<<END_FACTS>>>\n\nОсновной ответ сохрани в своем стиле."
+                }]
+                
+                response2 = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=reminder_context,
+                    temperature=0.7,
+                    max_tokens=2000
+                )
+                agent_response = response2.choices[0].message.content
+                
+                self.total_prompt_tokens += response2.usage.prompt_tokens
+                self.total_completion_tokens += response2.usage.completion_tokens
+                
+                print("✅ Повторный запрос выполнен, FACTS добавлены")
+            
             api_usage = {
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens
             }
             
-            # Обновляем статистику
             self.total_prompt_tokens += api_usage["prompt_tokens"]
             self.total_completion_tokens += api_usage["completion_tokens"]
             self.last_usage = api_usage
             
-            # Добавляем ответ
             assistant_msg = {"role": "assistant", "content": agent_response}
-            self.full_history.append(assistant_msg)
-            self.recent_messages.append(assistant_msg)
+            self.memory.add_message(assistant_msg)
             
             self._save_history()
             
@@ -481,38 +577,32 @@ class ContextCompressionAgent:
             return f"❌ Ошибка API: {str(e)}", None
     
     def reset(self):
-        """Сбрасывает диалог"""
-        self.full_history = []
-        self.recent_messages = []
-        self.summaries = []
+        self.memory.reset()
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.last_usage = None
-        self.compression_stats = {
-            "compressions_count": 0,
-            "total_tokens_saved": 0,
-            "original_tokens": 0,
-            "compressed_tokens": 0
-        }
-        
-        if self.system_prompt:
-            system_msg = {"role": "system", "content": self.system_prompt}
-            self.full_history.append(system_msg)
-        
         self._save_history()
     
     def get_history(self):
-        """Возвращает полную историю для отображения"""
-        return self.full_history.copy()
+        if isinstance(self.memory, BranchingMemory):
+            return self.memory.get_messages()
+        return list(self.memory.messages)
     
-    def get_compression_info(self):
-        """Возвращает информацию о компрессии"""
-        return self.compression_stats
+    def get_display_response(self, full_response):
+        """Возвращает ответ для отображения (без FACTS блока)"""
+        if isinstance(self.memory, FactMemory) and "<<<FACTS>>>" in full_response:
+            parts = full_response.split("<<<FACTS>>>")
+            return parts[0].strip()
+        return full_response
+    
+    def get_memory_stats(self):
+        return self.memory.get_stats()
 
 
 # ============================================================
 # ФУНКЦИИ ДЛЯ РАБОТЫ С СЕССИЯМИ
 # ============================================================
+
 def get_all_sessions(persist_dir="chat_history"):
     sessions = []
     if os.path.exists(persist_dir):
@@ -533,17 +623,17 @@ def get_all_sessions(persist_dir="chat_history"):
                     else:
                         date_str = "неизвестно"
                     
-                    token_stats = data.get("token_stats", {})
-                    token_info = f"{token_stats.get('total_tokens', 0)} токенов"
-                    
-                    # Добавляем информацию о компрессии
-                    compression_stats = data.get("compression_stats", {})
-                    comp_info = f" | 🗜️ {compression_stats.get('compressions_count', 0)} сжатий"
+                    strategy = data.get("strategy", "sliding_window")
+                    strategy_names = {
+                        "sliding_window": "📋 Окно",
+                        "facts": "💎 Факты",
+                        "branching": "🌿 Ветки"
+                    }
                     
                     sessions.append({
                         "id": session_id,
-                        "name": f"{preview[:40]} — {date_str}",
-                        "token_info": token_info + comp_info,
+                        "name": f"{preview[:35]} — {date_str}",
+                        "strategy": strategy_names.get(strategy, strategy),
                         "message_count": data.get("message_count", 0),
                         "file": f
                     })
@@ -563,9 +653,10 @@ def delete_session_file(session_id, persist_dir="chat_history"):
 # ============================================================
 # STREAMLIT ИНТЕРФЕЙС
 # ============================================================
+
 st.set_page_config(
-    page_title="AI Agent — Контекст-менеджер",
-    page_icon="🗜️",
+    page_title="AI Agent — Стратегии памяти",
+    page_icon="🧠",
     layout="wide"
 )
 
@@ -573,24 +664,40 @@ if not check_auth():
     authenticate()
     st.stop()
 
-st.title("🗜️ AI Агент — Управление контекстом с компрессией")
-st.caption("День 9: Сжатие истории для экономии токенов")
+st.title("🧠 AI Агент — Управление контекстом")
+st.caption("День 10: Sliding Window | Key-Value Facts | Branching")
+
+# Определяем, начат ли диалог
+is_conversation_started = False
+if "agent" in st.session_state and st.session_state.agent:
+    is_conversation_started = len(st.session_state.agent.get_history()) > 0
 
 # Боковая панель
 with st.sidebar:
     st.header("⚙️ Настройки")
     
+    if is_conversation_started:
+        st.info("🔒 Диалог начат. Настройки заблокированы. Создайте новую сессию для изменения параметров.")
+    
+    # Выбор модели
     model_options = {
-        "stepfun/step-3.5-flash:free": "Step 3.5 Flash (256K токенов)",
-        "nvidia/nemotron-3-super-120b-a12b:free": "Nemotron 3 Super (256K токенов)",
-        "arcee-ai/trinity-mini:free": "Trinity-mini (128K токенов)",
+        "stepfun/step-3.5-flash:free": "Step 3.5 Flash",
+        "nvidia/nemotron-3-super-120b-a12b:free": "Nemotron 3 Super",
+        "arcee-ai/trinity-mini:free": "Trinity-mini",
     }
-    selected_model = st.selectbox(
-        "Модель",
-        options=list(model_options.keys()),
-        format_func=lambda x: model_options[x],
-        index=0
-    )
+    
+    if is_conversation_started:
+        current_model = st.session_state.agent.model if "agent" in st.session_state else "stepfun/step-3.5-flash:free"
+        current_model_name = model_options.get(current_model, current_model)
+        st.text_input("Модель", value=current_model_name, disabled=True)
+        selected_model = current_model
+    else:
+        selected_model = st.selectbox(
+            "Модель",
+            options=list(model_options.keys()),
+            format_func=lambda x: model_options[x],
+            index=0
+        )
     
     model_limits = {
         "stepfun/step-3.5-flash:free": 256000,
@@ -599,27 +706,47 @@ with st.sidebar:
     }
     model_max_tokens = model_limits.get(selected_model, 256000)
     
-    system_preset = st.selectbox(
-        "Роль агента",
-        [
-            "Джедай-программист (мудрый, с юмором)",
-            "Эксперт по Python (строгий, по делу)",
-            "Мастер Йода (загадочный, с инверсией)"
-        ]
-    )
-    
-    if system_preset == "Джедай-программист (мудрый, с юмором)":
-        system_prompt = "Ты — джедай-программист по имени Дип. Отвечаешь мудро, с юмором, используешь аналогии из мира Звёздных Войн."
-    elif system_preset == "Эксперт по Python (строгий, по делу)":
-        system_prompt = "Ты — эксперт по Python. Отвечаешь кратко, чётко, по делу."
-    else:
-        system_prompt = "Ты — Мастер Йода. Отвечаешь с инверсией слов, загадочно. Начинаешь фразы с 'М-м-м...'."
-    
-    # Настройки компрессии
     st.divider()
-    st.subheader("🗜️ Настройки компрессии")
-    window_size = st.slider("Размер окна (сообщений без сжатия)", 4, 12, 6)
-    compress_after = st.slider("Сжимать после (сообщений)", 6, 20, 8)
+    
+    # Выбор роли агента
+    if is_conversation_started:
+        current_role = st.session_state.agent.role
+        st.text_input("🎭 Роль агента", value=current_role, disabled=True)
+        role = current_role
+    else:
+        role = st.selectbox(
+            "🎭 Роль агента",
+            list(SYSTEM_PROMPTS_BASE.keys())
+        )
+    
+    st.divider()
+    
+    # Выбор стратегии памяти
+    st.subheader("🗜️ Стратегия памяти")
+    strategy_options = {
+        "sliding_window": "📋 Sliding Window — последние N сообщений",
+        "facts": "💎 Key-Value Facts — факты + последние сообщения",
+        "branching": "🌿 Branching — ветки диалога"
+    }
+    
+    if is_conversation_started:
+        current_strategy = st.session_state.agent.strategy_name
+        strategy_name = strategy_options.get(current_strategy, current_strategy)
+        st.text_input("Стратегия", value=strategy_name, disabled=True)
+        selected_strategy = current_strategy
+        window_size = st.session_state.agent.memory.window_size
+    else:
+        selected_strategy = st.selectbox(
+            "Стратегия",
+            options=list(strategy_options.keys()),
+            format_func=lambda x: strategy_options[x],
+            index=0
+        )
+        window_size = st.slider(
+            "Размер окна (сообщений)", 
+            3, 15, 8,
+            help="Сколько последних сообщений хранить"
+        )
     
     st.divider()
     
@@ -627,49 +754,49 @@ with st.sidebar:
     if "agent" in st.session_state and st.session_state.agent:
         token_stats = st.session_state.agent.get_token_stats()
         
-        st.subheader("📊 Токен-статистика")
+        st.subheader("📊 Статистика")
         progress_value = token_stats["usage_percent"] / 100
         st.progress(progress_value, text=f"{token_stats['usage_percent']}% использовано")
         
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("📥 Токенов запроса", f"{token_stats['prompt_tokens']:,}")
+            st.metric("📥 Запросы", f"{token_stats['prompt_tokens']:,}")
         with col2:
-            st.metric("📤 Токенов ответа", f"{token_stats['completion_tokens']:,}")
+            st.metric("📤 Ответы", f"{token_stats['completion_tokens']:,}")
         
         st.metric("📚 Всего токенов", f"{token_stats['total_tokens']:,}")
         
-        # Статистика компрессии
-        if token_stats.get("compression"):
-            comp = token_stats["compression"]
-            st.divider()
-            st.subheader("🗜️ Эффективность компрессии")
-            st.metric("Количество сжатий", comp["compressions"])
-            st.metric("Сэкономлено токенов", f"{comp['tokens_saved']:,}")
-            st.metric("Эффективность", f"{comp['efficiency']}%")
+        st.divider()
+        st.subheader("🧠 Память")
+        mem_stats = token_stats.get("memory_stats", {})
+        st.caption(f"**Тип:** {mem_stats.get('type', '—')}")
+        
+        if selected_strategy == "sliding_window":
+            st.caption(f"**Сообщений в окне:** {mem_stats.get('current_messages', 0)}/{mem_stats.get('window_size', '—')}")
+            st.caption(f"**Всего сообщений:** {mem_stats.get('total_messages', 0)}")
+        
+        elif selected_strategy == "facts":
+            st.caption(f"**Сообщений в окне:** {mem_stats.get('current_messages', 0)}/{mem_stats.get('window_size', '—')}")
+            st.caption(f"**Фактов сохранено:** {mem_stats.get('facts_count', 0)}")
+            if mem_stats.get('fact_changes', 0) > 0:
+                st.caption(f"**Изменений фактов:** {mem_stats.get('fact_changes', 0)}")
+        
+        elif selected_strategy == "branching":
+            st.caption(f"**Активная ветка:** {mem_stats.get('active_branch', 'main')}")
+            st.caption(f"**Всего веток:** {mem_stats.get('branches_count', 0)}")
+            st.caption(f"**Чекапоинтов:** {mem_stats.get('checkpoints_count', 0)}")
+            branches_list = mem_stats.get('branches', [])
+            if branches_list:
+                st.caption(f"**Ветки:** {', '.join(branches_list)}")
     
     st.divider()
     
     # История диалогов
-    st.subheader("📁 История диалогов")
+    st.subheader("📁 История")
     all_sessions = get_all_sessions()
     
     if all_sessions:
-        for sess in all_sessions:
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                st.write(f"**{sess['name']}**")
-                st.caption(f"{sess['message_count']} сообщений | {sess['token_info']}")
-            with col2:
-                if st.button("🗑️", key=f"del_{sess['id']}"):
-                    if delete_session_file(sess['id']):
-                        st.success(f"✅ Диалог удалён")
-                        if "agent" in st.session_state and st.session_state.agent.session_id == sess['id']:
-                            st.session_state.agent = None
-                        st.rerun()
-            st.divider()
-        
-        session_options = {s["id"]: s["name"] for s in all_sessions}
+        session_options = {s["id"]: f"{s['name']} [{s['strategy']}]" for s in all_sessions}
         current_session_id = st.session_state.get("session_id", None)
         
         selected_session_id = st.selectbox(
@@ -679,24 +806,77 @@ with st.sidebar:
             index=0 if current_session_id in session_options else 0
         )
         
-        if st.button("🔄 Переключить сессию", use_container_width=True):
-            if selected_session_id != st.session_state.get("session_id"):
-                with st.spinner("Загрузка диалога..."):
-                    new_agent = ContextCompressionAgent(
-                        model=selected_model,
-                        system_prompt=system_prompt,
-                        session_id=selected_session_id,
-                        model_max_tokens=model_max_tokens,
-                        window_size=window_size,
-                        compress_after=compress_after
-                    )
-                    new_agent._load_history()
-                    st.session_state.agent = new_agent
-                    st.session_state.session_id = selected_session_id
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Загрузить", use_container_width=True):
+                if selected_session_id != st.session_state.get("session_id"):
+                    with st.spinner("Загрузка..."):
+                        new_agent = Agent(
+                            model=selected_model,
+                            role=role,
+                            session_id=selected_session_id,
+                            model_max_tokens=model_max_tokens,
+                            strategy=selected_strategy,
+                            window_size=window_size
+                        )
+                        new_agent._load_history()
+                        st.session_state.agent = new_agent
+                        st.session_state.session_id = selected_session_id
+                        st.rerun()
+        
+        with col2:
+            if st.button("🗑️ Удалить", use_container_width=True, help="Удалить текущий диалог"):
+                if delete_session_file(selected_session_id):
+                    st.success("✅ Диалог удалён")
+                    if "agent" in st.session_state and st.session_state.agent.session_id == selected_session_id:
+                        st.session_state.agent = None
                     st.rerun()
     else:
         st.info("Нет сохранённых диалогов")
     
+    st.divider()
+    
+    # Управление для стратегии Branching
+    if (selected_strategy == "branching" and "agent" in st.session_state and 
+        st.session_state.agent and isinstance(st.session_state.agent.memory, BranchingMemory)):
+        
+        st.subheader("🌿 Управление ветками")
+        
+        branch_name = st.text_input("Имя новой ветки", key="new_branch_name")
+        checkpoint_name = st.text_input("Название чекапоинта", key="checkpoint_name")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📸 Создать чекапоинт", use_container_width=True):
+                cp_name = checkpoint_name.strip() or f"cp_{len(st.session_state.agent.memory.checkpoints) + 1}"
+                cp = st.session_state.agent.memory.create_checkpoint(cp_name)
+                st.success(f"✅ Чекапоинт '{cp['name']}' создан")
+                st.rerun()
+        
+        with col2:
+            if st.button("🌿 Создать ветку", use_container_width=True):
+                if branch_name.strip() and checkpoint_name.strip():
+                    if st.session_state.agent.memory.create_branch(checkpoint_name.strip(), branch_name.strip()):
+                        st.success(f"✅ Ветка '{branch_name}' создана")
+                        st.rerun()
+                    else:
+                        st.error("❌ Чекапоинт не найден")
+                else:
+                    st.warning("⚠️ Укажите имя ветки и чекапоинт")
+        
+        try:
+            available_branches = st.session_state.agent.memory.get_branches()
+            if len(available_branches) > 1:
+                switch_branch = st.selectbox("Переключиться на ветку", available_branches)
+                if st.button("🔀 Переключить", use_container_width=True):
+                    if st.session_state.agent.memory.switch_branch(switch_branch):
+                        st.success(f"✅ Переключено на '{switch_branch}'")
+                        st.rerun()
+        except Exception as e:
+            st.error(f"Ошибка получения веток: {e}")
+    
+    # Кнопки управления
+    st.divider()
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🗑️ Сбросить диалог", use_container_width=True):
@@ -704,40 +884,36 @@ with st.sidebar:
                 st.session_state.agent.reset()
             st.rerun()
     with col2:
-        if st.button("🔄 Принудительно сжать", use_container_width=True):
-            if "agent" in st.session_state:
-                st.session_state.agent._compress_old_messages()
-                st.session_state.agent._save_history()
-                st.success("✅ Принудительное сжатие выполнено")
-                st.rerun()
+        if st.button("🔄 Новая сессия", use_container_width=True):
+            st.session_state.agent = None
+            st.session_state.session_id = None
+            st.rerun()
     
-    st.divider()
-    st.caption("🗜️ Старые сообщения сжимаются в summary")
-    st.caption(f"📦 Окно: {window_size} сообщений без сжатия")
-    st.caption(f"⚙️ Сжатие каждые {compress_after} сообщений")
+    st.caption(f"🗜️ Стратегия: {strategy_options.get(selected_strategy, selected_strategy).split('—')[0].strip()}")
 
 # Инициализация агента
 if "agent" not in st.session_state or st.session_state.agent is None:
-    st.session_state.agent = ContextCompressionAgent(
+    st.session_state.agent = Agent(
         model=selected_model,
-        system_prompt=system_prompt,
+        role=role,
         session_id=st.session_state.get("session_id", None),
         model_max_tokens=model_max_tokens,
-        window_size=window_size,
-        compress_after=compress_after
+        strategy=selected_strategy,
+        window_size=window_size
     )
     st.session_state.session_id = st.session_state.agent.session_id
 
-# Если изменилась модель
-if st.session_state.agent.model != selected_model:
+# Если изменилась стратегия и диалог не начат
+if (not is_conversation_started and 
+    st.session_state.agent.strategy_name != selected_strategy):
     old_session_id = st.session_state.agent.session_id
-    st.session_state.agent = ContextCompressionAgent(
+    st.session_state.agent = Agent(
         model=selected_model,
-        system_prompt=system_prompt,
+        role=role,
         session_id=old_session_id,
         model_max_tokens=model_max_tokens,
-        window_size=window_size,
-        compress_after=compress_after
+        strategy=selected_strategy,
+        window_size=window_size
     )
     st.session_state.session_id = st.session_state.agent.session_id
 
@@ -749,10 +925,13 @@ with chat_container:
     for msg in st.session_state.agent.get_history():
         if msg["role"] == "system":
             continue
-        role = msg["role"]
-        avatar = "👤" if role == "user" else "🤖"
-        with st.chat_message(role, avatar=avatar):
-            st.markdown(msg["content"])
+        role_icon = "👤" if msg["role"] == "user" else "🤖"
+        with st.chat_message(msg["role"], avatar=role_icon):
+            if msg["role"] == "assistant" and isinstance(st.session_state.agent.memory, FactMemory):
+                display_text = st.session_state.agent.get_display_response(msg["content"])
+            else:
+                display_text = msg["content"]
+            st.markdown(display_text)
 
 # Поле ввода
 user_input = st.chat_input("Напиши свой вопрос...")
@@ -760,6 +939,4 @@ user_input = st.chat_input("Напиши свой вопрос...")
 if user_input:
     with st.spinner("Агент размышляет... 🤔"):
         response, token_usage = st.session_state.agent.think(user_input)
-    
-    # Обновляем интерфейс
     st.rerun()
